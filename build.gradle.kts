@@ -16,6 +16,7 @@ dependencies {
     implementation("io.javalin:javalin:6.3.0")
     implementation("org.yaml:snakeyaml:2.3")
     implementation("org.slf4j:slf4j-simple:2.0.16")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.2")
     // Plan 3 client — baked in, its classes are the injection payload.
     implementation(files("libs/podatek-license-client-1.0.0.jar"))
     // Bukkit API only for tests (fixture plugin extends JavaPlugin).
