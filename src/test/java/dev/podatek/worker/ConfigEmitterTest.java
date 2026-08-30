@@ -18,6 +18,9 @@ class ConfigEmitterTest {
                 Map.of("k1", "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="), "k1", "license.key");
         byte[] gc = ConfigEmitter.emit(prefix, cfg, new byte[]{1, 2, 3, 4});
         assertEquals(52, ((gc[6] & 0xFF) << 8) | (gc[7] & 0xFF), "major version must be 52");
+        // With a salt, string constants must be obfuscated: plaintext URL absent from bytes.
+        String raw = new String(gc, java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertFalse(raw.contains("auth4.podatek.dev"), "baseUrl must not appear in plaintext");
 
         Map<String, byte[]> all = new HashMap<>(payload);
         all.put(prefix + "/GeneratedConfig", gc);

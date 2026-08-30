@@ -21,10 +21,11 @@ public final class ConfigEmitter {
      */
     public static byte[] emit(String prefix, InjectConfig cfg, byte[] salt) {
         String owner = prefix + "/GeneratedConfig";
-        // Stage 1 (de-risking): plain LDC constants only. XOR obfuscation enabled in a later commit.
-        boolean obfuscate = false;
+        // XOR string-obfuscation is enabled when a non-empty salt is supplied.
+        boolean obfuscate = salt != null && salt.length > 0;
 
-        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        // COMPUTE_FRAMES: the decoder's loop needs stack-map frames at major 52.
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER,
                 owner, null, "java/lang/Object", null);
 
