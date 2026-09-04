@@ -58,18 +58,30 @@ public final class Obfuscator {
     static final String DECODER_DESC = "([B)Ljava/lang/String;";
     static final String OPAQUE_FIELD = "Q";
     static final String OPAQUE_DESC = "I";
+    static final String DISPATCH_TABLE = "T";     // runtime-filled identity table for non-foldable CFF dispatch
+    static final String DISPATCH_TABLE_DESC = "[I";
+    static final int DISPATCH_TABLE_SIZE = 1024;
     private static final byte[] JUNK_DECOY = {0x4f, 0x4b, 0x2d, 0x67, 0x72, 0x61, 0x63, 0x65}; // "OK-grace"
 
     public static Map<String, byte[]> obfuscate(Map<String, byte[]> classes, String relocPrefix, byte[] salt) {
         if (salt == null || salt.length == 0) return classes;
         String holderInternal = relocPrefix + "/K";
 
+        // Superclass map over our classes (for the COMPUTE_FRAMES tier's getCommonSuperClass).
+        Map<String, String> superOf = new LinkedHashMap<>();
+        for (Map.Entry<String, byte[]> e : classes.entrySet()) {
+            if (!e.getKey().startsWith(relocPrefix + "/") || !e.getKey().endsWith(".class")) continue;
+            ClassNode probe = new ClassNode();
+            new ClassReader(e.getValue()).accept(probe, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
+            superOf.put(probe.name, probe.superName);
+        }
+
         Map<String, byte[]> out = new LinkedHashMap<>();
         boolean anyProcessed = false;
         for (Map.Entry<String, byte[]> e : classes.entrySet()) {
             String key = e.getKey();
             if (isTarget(key, relocPrefix)) {
-                out.put(key, transform(e.getValue(), holderInternal, salt));
+                out.put(key, transform(e.getValue(), holderInternal, salt, superOf));
                 anyProcessed = true;
             } else {
                 out.put(key, e.getValue());
@@ -98,10 +110,40 @@ public final class Obfuscator {
      * JVM may still accept — we do not ship it), the class is degraded to string-encryption only,
      * which is proven safe and always round-trips. No plaintext leaks in either case.
      */
-    private static byte[] transform(byte[] classBytes, String holderInternal, byte[] salt) {
-        byte[] full = apply(classBytes, holderInternal, salt, true);
-        if (roundTrips(full)) return full;
+    private static byte[] transform(byte[] classBytes, String holderInternal, byte[] salt,
+                                    Map<String, String> superOf) {
+        // Tier 1 — BROAD: flatten every eligible method (incl. local writes) + opaque + strings, with
+        // COMPUTE_FRAMES via a writer that resolves our/java types and ABORTS on any bukkit-type merge
+        // (so it never emits an imprecise frame). Falls through if it aborts or can't round-trip.
+        try {
+            byte[] broad = applyComputeFrames(classBytes, holderInternal, salt, superOf);
+            if (roundTrips(broad)) return broad;
+        } catch (AbortFlatten ignored) {
+            // a frame merge needed a bukkit type we cannot resolve at inject time — degrade
+        }
+        // Tier 2 — MANUAL: string-safe opaque + no-local-write flattening with hand-built frames.
+        byte[] manual = apply(classBytes, holderInternal, salt, true);
+        if (roundTrips(manual)) return manual;
+        // Tier 3 — string-encryption only (always valid, always round-trips).
         return apply(classBytes, holderInternal, salt, false);
+    }
+
+    /** BROAD tier: control-flow layers rely on COMPUTE_FRAMES; no manual frames are emitted. */
+    private static byte[] applyComputeFrames(byte[] classBytes, String holderInternal, byte[] salt,
+                                             Map<String, String> superOf) {
+        ClassNode cn = new ClassNode();
+        new ClassReader(classBytes).accept(cn, ClassReader.EXPAND_FRAMES);
+        if (cn.methods != null) {
+            for (MethodNode mn : cn.methods) {
+                boolean flattened = Flattener.flatten(mn, cn.name, holderInternal, true); // frames computed
+                encryptMethodStrings(mn, holderInternal, salt);
+                if (!flattened) injectOpaquePredicate(mn, cn.name, holderInternal, salt, true);
+            }
+        }
+        encryptConstantValueFields(cn, holderInternal, salt);
+        ClassWriter cw = new HierarchyClassWriter(ClassWriter.COMPUTE_FRAMES, superOf);
+        cn.accept(cw); // getCommonSuperClass throws AbortFlatten on an unresolvable (bukkit) merge
+        return cw.toByteArray();
     }
 
     private static byte[] apply(byte[] classBytes, String holderInternal, byte[] salt, boolean controlFlow) {
@@ -111,10 +153,10 @@ public final class Obfuscator {
 
         if (cn.methods != null) {
             for (MethodNode mn : cn.methods) {
-                boolean flattened = controlFlow && Flattener.flatten(mn, cn.name);   // Layer 3
+                boolean flattened = controlFlow && Flattener.flatten(mn, cn.name, holderInternal, false);
                 encryptMethodStrings(mn, holderInternal, salt);                      // Layer 1
                 if (controlFlow && !flattened) {
-                    injectOpaquePredicate(mn, cn.name, holderInternal, salt);        // Layer 2
+                    injectOpaquePredicate(mn, cn.name, holderInternal, salt, false);  // Layer 2
                 }
             }
         }
@@ -125,6 +167,49 @@ public final class Obfuscator {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         cn.accept(cw);
         return cw.toByteArray();
+    }
+
+    /** Thrown when COMPUTE_FRAMES would need the common supertype of types we cannot resolve
+     *  without loading bukkit (absent at inject time). Signals: degrade this class. */
+    static final class AbortFlatten extends RuntimeException {
+        AbortFlatten() { super(null, null, false, false); }
+    }
+
+    /**
+     * ClassWriter whose {@code getCommonSuperClass} resolves our relocated types (from a superclass
+     * map) and {@code java/*} types (loadable at inject time), and throws {@link AbortFlatten} the
+     * moment it would need a bukkit type (unresolvable) — rather than silently returning Object and
+     * risking an invalid frame. Interfaces merge to Object (valid per JVMS).
+     */
+    static final class HierarchyClassWriter extends ClassWriter {
+        private final Map<String, String> superOf;
+        HierarchyClassWriter(int flags, Map<String, String> superOf) { super(flags); this.superOf = superOf; }
+
+        @Override
+        protected String getCommonSuperClass(String a, String b) {
+            if (a.equals(b)) return a;
+            if (a.equals("java/lang/Object") || b.equals("java/lang/Object")) return "java/lang/Object";
+            java.util.Set<String> up = new java.util.LinkedHashSet<>();
+            for (String c = a; c != null; c = superOfOrThrow(c)) { up.add(c); if (c.equals("java/lang/Object")) break; }
+            for (String c = b; c != null; c = superOfOrThrow(c)) { if (up.contains(c)) return c; if (c.equals("java/lang/Object")) break; }
+            return "java/lang/Object";
+        }
+
+        /** Next superclass of an internal name, or null past Object. Throws AbortFlatten if unresolvable. */
+        private String superOfOrThrow(String internal) {
+            if (internal.equals("java/lang/Object")) return null;
+            String s = superOf.get(internal);
+            if (s != null) return s;                 // our relocated class
+            // java/* is loadable at inject time; bukkit/* is not -> abort.
+            try {
+                Class<?> c = Class.forName(internal.replace('/', '.'), false, HierarchyClassWriter.class.getClassLoader());
+                if (c.isInterface()) return "java/lang/Object";
+                Class<?> sup = c.getSuperclass();
+                return sup == null ? "java/lang/Object" : sup.getName().replace('.', '/');
+            } catch (Throwable t) {
+                throw new AbortFlatten();
+            }
+        }
     }
 
     /** True iff ASM can fully re-read the class (frames included). */
@@ -180,7 +265,8 @@ public final class Obfuscator {
      * decompiler cannot fold it. Skips constructors, static initializers, and abstract/native/empty
      * methods (injecting before a super() call, or into a bodyless method, is illegal).
      */
-    private static void injectOpaquePredicate(MethodNode mn, String owner, String holderInternal, byte[] salt) {
+    private static void injectOpaquePredicate(MethodNode mn, String owner, String holderInternal,
+                                              byte[] salt, boolean computeFrames) {
         if ("<init>".equals(mn.name) || "<clinit>".equals(mn.name)) return;
         if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return;
         if (mn.instructions == null || mn.instructions.size() == 0) return;
@@ -196,10 +282,14 @@ public final class Obfuscator {
         pre.add(pushByteArrayList(xor(JUNK_DECOY, salt)));
         pre.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holderInternal, DECODER_NAME, DECODER_DESC, false));
         pre.add(new InsnNode(Opcodes.POP));
-        // real: (branch target) — explicit absolute frame = method entry (params, empty stack)
+        // real: (branch target)
         pre.add(real);
-        Object[] locals = entryLocals(mn.access, owner, mn.desc);
-        pre.add(new FrameNode(Opcodes.F_NEW, locals.length, locals, 0, new Object[0]));
+        // In manual-frame mode, emit the absolute entry frame here; under COMPUTE_FRAMES the writer
+        // computes it, so no manual frame is added.
+        if (!computeFrames) {
+            Object[] locals = entryLocals(mn.access, owner, mn.desc);
+            pre.add(new FrameNode(Opcodes.F_NEW, locals.length, locals, 0, new Object[0]));
+        }
 
         mn.instructions.insert(pre); // prepend to the whole method
     }
@@ -273,6 +363,7 @@ public final class Obfuscator {
                 holderInternal, null, "java/lang/Object", null);
 
         cw.visitField(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, OPAQUE_FIELD, OPAQUE_DESC, null, null).visitEnd();
+        cw.visitField(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, DISPATCH_TABLE, DISPATCH_TABLE_DESC, null, null).visitEnd();
 
         MethodVisitor ctor = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
         ctor.visitCode();
@@ -282,12 +373,35 @@ public final class Obfuscator {
         ctor.visitMaxs(0, 0);
         ctor.visitEnd();
 
-        // static { Q = (int) System.nanoTime(); }  -- runtime seed => decompiler cannot fold (Q|1)!=0
+        // static {
+        //   Q = (int) System.nanoTime();              // runtime seed => (Q|1)!=0 not foldable
+        //   T = new int[N]; for (i=0;i<N;i++) T[i]=i;  // loop-filled => decompiler can't know T[state]
+        // }
         MethodVisitor cl = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
         cl.visitCode();
         cl.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false);
         cl.visitInsn(Opcodes.L2I);
         cl.visitFieldInsn(Opcodes.PUTSTATIC, holderInternal, OPAQUE_FIELD, OPAQUE_DESC);
+        // T = new int[DISPATCH_TABLE_SIZE]
+        pushIntMv(cl, DISPATCH_TABLE_SIZE);
+        cl.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_INT);
+        cl.visitFieldInsn(Opcodes.PUTSTATIC, holderInternal, DISPATCH_TABLE, DISPATCH_TABLE_DESC);
+        // for (int i = 0; i < DISPATCH_TABLE_SIZE; i++) T[i] = i;
+        cl.visitInsn(Opcodes.ICONST_0);
+        cl.visitVarInsn(Opcodes.ISTORE, 0);
+        org.objectweb.asm.Label ltop = new org.objectweb.asm.Label();
+        org.objectweb.asm.Label lend = new org.objectweb.asm.Label();
+        cl.visitLabel(ltop);
+        cl.visitVarInsn(Opcodes.ILOAD, 0);
+        pushIntMv(cl, DISPATCH_TABLE_SIZE);
+        cl.visitJumpInsn(Opcodes.IF_ICMPGE, lend);
+        cl.visitFieldInsn(Opcodes.GETSTATIC, holderInternal, DISPATCH_TABLE, DISPATCH_TABLE_DESC);
+        cl.visitVarInsn(Opcodes.ILOAD, 0);
+        cl.visitVarInsn(Opcodes.ILOAD, 0);
+        cl.visitInsn(Opcodes.IASTORE);
+        cl.visitIincInsn(0, 1);
+        cl.visitJumpInsn(Opcodes.GOTO, ltop);
+        cl.visitLabel(lend);
         cl.visitInsn(Opcodes.RETURN);
         cl.visitMaxs(0, 0);
         cl.visitEnd();

@@ -3,6 +3,7 @@ package dev.podatek.worker;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
@@ -51,7 +52,7 @@ final class Flattener {
     private Flattener() {}
 
     /** Attempts to flatten {@code mn}. Returns true iff it rewrote the body. */
-    static boolean flatten(MethodNode mn, String owner) {
+    static boolean flatten(MethodNode mn, String owner, String holder, boolean computeFrames) {
         if ("<init>".equals(mn.name) || "<clinit>".equals(mn.name)) return false;
         if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return false;
         if (mn.instructions == null || mn.instructions.size() == 0) return false;
@@ -63,8 +64,8 @@ final class Flattener {
             int op = in.getOpcode();
             if (op == Opcodes.JSR || op == Opcodes.RET
                     || op == Opcodes.TABLESWITCH || op == Opcodes.LOOKUPSWITCH) return false;
-            if (op >= Opcodes.ISTORE && op <= Opcodes.ASTORE) return false; // local write
-            if (op == Opcodes.IINC) return false;                          // local write
+            if (!computeFrames && op >= Opcodes.ISTORE && op <= Opcodes.ASTORE) return false; // manual frames require constant locals
+            if (!computeFrames && op == Opcodes.IINC) return false;
         }
 
         // Empty operand stack at every block boundary (type-free, no class loading).
@@ -96,7 +97,7 @@ final class Flattener {
             if (f != null && f.getStackSize() != 0) return false;
         }
 
-        return rebuild(mn, owner, blocks);
+        return rebuild(mn, owner, holder, blocks, computeFrames);
     }
 
     // ---- block model ----------------------------------------------------------------------
@@ -149,7 +150,7 @@ final class Flattener {
 
     // ---- rebuild --------------------------------------------------------------------------
 
-    private static boolean rebuild(MethodNode mn, String owner, List<Block> blocks) {
+    private static boolean rebuild(MethodNode mn, String owner, String holder, List<Block> blocks, boolean computeFrames) {
         Object[] entryLocals = entryLocals(mn.access, owner, mn.desc);
         int stateSlot = mn.maxLocals; // no local writes => maxLocals == param slots; this slot is free
         Object[] sharedLocals = withStateSlot(entryLocals, stateSlot);
@@ -177,11 +178,15 @@ final class Flattener {
 
         Block entry = blocks.get(0);
         appendBody(out, entry.body);
-        emitRouting(out, entry, next(blocks, entry), byLeader, dispatch, stateSlot, sharedLocals);
+        emitRouting(out, entry, next(blocks, entry), byLeader, dispatch, stateSlot, sharedLocals, computeFrames);
 
         out.add(dispatch);
-        out.add(frame(sharedLocals));
+        if (!computeFrames) out.add(frame(sharedLocals));
+        // Non-foldable dispatch: switch(K.T[state]) where K.T is a runtime loop-filled identity table.
+        // A decompiler cannot statically know T[state], so it cannot rebuild the control-flow graph.
+        out.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, Obfuscator.DISPATCH_TABLE, Obfuscator.DISPATCH_TABLE_DESC));
         out.add(new VarInsnNode(Opcodes.ILOAD, stateSlot));
+        out.add(new InsnNode(Opcodes.IALOAD));
         int[] keys = new int[nonEntry.size()];
         LabelNode[] labels = new LabelNode[nonEntry.size()];
         for (int i = 0; i < nonEntry.size(); i++) { keys[i] = nonEntry.get(i).id; labels[i] = label.get(nonEntry.get(i)); }
@@ -189,9 +194,9 @@ final class Flattener {
 
         for (Block b : order) {
             out.add(label.get(b));
-            out.add(frame(sharedLocals));
+            if (!computeFrames) out.add(frame(sharedLocals));
             appendBody(out, b.body);
-            emitRouting(out, b, next(blocks, b), byLeader, dispatch, stateSlot, sharedLocals);
+            emitRouting(out, b, next(blocks, b), byLeader, dispatch, stateSlot, sharedLocals, computeFrames);
         }
 
         mn.instructions = out;
@@ -203,7 +208,7 @@ final class Flattener {
     }
 
     private static void emitRouting(InsnList out, Block b, Block next, Map<LabelNode, Block> byLeader,
-                                    LabelNode dispatch, int stateSlot, Object[] sharedLocals) {
+                                    LabelNode dispatch, int stateSlot, Object[] sharedLocals, boolean computeFrames) {
         AbstractInsnNode t = b.terminator;
         if (t == null) { routeTo(out, next, dispatch, stateSlot); return; }
         int op = t.getOpcode();
@@ -215,7 +220,7 @@ final class Flattener {
         out.add(new JumpInsnNode(op, thenL));
         routeTo(out, next, dispatch, stateSlot);
         out.add(thenL);
-        out.add(frame(sharedLocals));
+        if (!computeFrames) out.add(frame(sharedLocals));
         routeTo(out, taken, dispatch, stateSlot);
     }
 

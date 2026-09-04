@@ -57,6 +57,14 @@ class DecompileResistanceTest {
                 "expected encrypted byte[] literals in decompiled source");
         assertTrue(enforcer.contains(".d("),
                 "expected runtime decoder call K.d(...) in decompiled source");
+
+        // Control-flow flattening must survive decompilation as a NON-foldable state machine:
+        // the dispatcher reads a runtime table (K.T[state]) the decompiler cannot resolve, so
+        // Vineflower cannot reconstruct the original if/loop structure — it leaves switch-on-table
+        // dispatch. If this regresses (e.g. dispatch on a plain int the decompiler can fold), the
+        // flattening is cosmetic and this fails.
+        assertTrue(enforcer.contains(".T["),
+                "expected non-foldable table dispatch (K.T[state]) in decompiled flattened methods");
     }
 
     private static String readDecompiled(Path outDir, String fileSuffix) throws Exception {
