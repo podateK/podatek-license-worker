@@ -13,6 +13,8 @@ repositories {
 dependencies {
     implementation("org.ow2.asm:asm:9.7")
     implementation("org.ow2.asm:asm-commons:9.7") // ClassRemapper, Remapper
+    implementation("org.ow2.asm:asm-tree:9.7")     // tree API (Obfuscator/Flattener)
+    implementation("org.ow2.asm:asm-analysis:9.7") // BasicInterpreter (empty-stack verification)
     implementation("io.javalin:javalin:6.3.0")
     implementation("org.yaml:snakeyaml:2.3")
     implementation("org.slf4j:slf4j-simple:2.0.16")
@@ -28,3 +30,4 @@ dependencies {
     testImplementation("org.vineflower:vineflower:1.10.1")
 }
 tasks.test { useJUnitPlatform(); testLogging { events("passed","skipped","failed") } }
+

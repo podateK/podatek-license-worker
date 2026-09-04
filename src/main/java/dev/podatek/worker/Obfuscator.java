@@ -92,15 +92,30 @@ public final class Obfuscator {
         return true;
     }
 
+    /**
+     * Applies all layers, then guarantees the result is well-formed by re-reading it with ASM. If
+     * control-flow layers produced a class ASM cannot round-trip (a rare frame edge case that the
+     * JVM may still accept — we do not ship it), the class is degraded to string-encryption only,
+     * which is proven safe and always round-trips. No plaintext leaks in either case.
+     */
     private static byte[] transform(byte[] classBytes, String holderInternal, byte[] salt) {
+        byte[] full = apply(classBytes, holderInternal, salt, true);
+        if (roundTrips(full)) return full;
+        return apply(classBytes, holderInternal, salt, false);
+    }
+
+    private static byte[] apply(byte[] classBytes, String holderInternal, byte[] salt, boolean controlFlow) {
         ClassNode cn = new ClassNode();
         // EXPAND_FRAMES: frames become absolute (F_NEW), so we may insert one freely.
         new ClassReader(classBytes).accept(cn, ClassReader.EXPAND_FRAMES);
 
         if (cn.methods != null) {
             for (MethodNode mn : cn.methods) {
-                encryptMethodStrings(mn, holderInternal, salt);   // Layer 1
-                injectOpaquePredicate(mn, cn.name, holderInternal, salt); // Layer 2
+                boolean flattened = controlFlow && Flattener.flatten(mn, cn.name);   // Layer 3
+                encryptMethodStrings(mn, holderInternal, salt);                      // Layer 1
+                if (controlFlow && !flattened) {
+                    injectOpaquePredicate(mn, cn.name, holderInternal, salt);        // Layer 2
+                }
             }
         }
         encryptConstantValueFields(cn, holderInternal, salt);     // Layer 1 (fields)
@@ -110,6 +125,16 @@ public final class Obfuscator {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         cn.accept(cw);
         return cw.toByteArray();
+    }
+
+    /** True iff ASM can fully re-read the class (frames included). */
+    private static boolean roundTrips(byte[] classBytes) {
+        try {
+            new ClassReader(classBytes).accept(new ClassNode(), 0);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     // ---- Layer 1: strings -----------------------------------------------------------------
