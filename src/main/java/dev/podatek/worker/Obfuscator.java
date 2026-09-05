@@ -18,6 +18,9 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.analysis.Analyzer;
+import org.objectweb.asm.tree.analysis.BasicValue;
+import org.objectweb.asm.tree.analysis.BasicVerifier;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -117,13 +120,13 @@ public final class Obfuscator {
         // (so it never emits an imprecise frame). Falls through if it aborts or can't round-trip.
         try {
             byte[] broad = applyComputeFrames(classBytes, holderInternal, salt, superOf);
-            if (roundTrips(broad)) return broad;
+            if (verifies(broad)) return broad;
         } catch (AbortFlatten ignored) {
             // a frame merge needed a bukkit type we cannot resolve at inject time — degrade
         }
         // Tier 2 — MANUAL: string-safe opaque + no-local-write flattening with hand-built frames.
         byte[] manual = apply(classBytes, holderInternal, salt, true);
-        if (roundTrips(manual)) return manual;
+        if (verifies(manual)) return manual;
         // Tier 3 — string-encryption only (always valid, always round-trips).
         return apply(classBytes, holderInternal, salt, false);
     }
@@ -216,6 +219,28 @@ public final class Obfuscator {
     private static boolean roundTrips(byte[] classBytes) {
         try {
             new ClassReader(classBytes).accept(new ClassNode(), 0);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * MANDATORY loadability gate. A class is accepted only if ASM can round-trip it AND every method
+     * passes ASM's {@link BasicVerifier} data-flow analysis — which detects reading an
+     * uninitialized/Top local or a stack-shape error WITHOUT loading bukkit (references are treated
+     * generically). This is what catches the frames the real HotSpot verifier rejects (e.g. the
+     * activateNow VerifyError) at inject time; a failing class falls back to a weaker, valid tier.
+     */
+    private static boolean verifies(byte[] classBytes) {
+        if (!roundTrips(classBytes)) return false;
+        try {
+            ClassNode cn = new ClassNode();
+            new ClassReader(classBytes).accept(cn, 0);
+            for (MethodNode mn : cn.methods) {
+                if (mn.instructions == null || mn.instructions.size() == 0) continue;
+                new Analyzer<BasicValue>(new BasicVerifier()).analyze(cn.name, mn);
+            }
             return true;
         } catch (Throwable t) {
             return false;

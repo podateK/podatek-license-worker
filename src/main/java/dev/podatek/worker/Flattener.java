@@ -5,6 +5,7 @@ import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
@@ -23,6 +24,7 @@ import org.objectweb.asm.tree.analysis.Frame;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -96,6 +98,14 @@ final class Flattener {
             Frame<BasicValue> f = frames[idx];
             if (f != null && f.getStackSize() != 0) return false;
         }
+
+        // Opaque K.T[state] dispatch defeats the verifier's definite-assignment proof across the
+        // dispatcher, so a non-parameter local that is live BETWEEN blocks merges to Top at the
+        // dispatcher and a later read fails verification (the activateNow crash). Only flatten when
+        // every cross-block local read is a parameter or was assigned unconditionally in the entry
+        // block (which always runs before the dispatcher). Manual-frame mode already forbids all
+        // local writes, so this only matters for the COMPUTE_FRAMES (broad) mode.
+        if (computeFrames && hasUnsafeCrossBlockLocal(mn, blocks)) return false;
 
         return rebuild(mn, owner, holder, blocks, computeFrames);
     }
@@ -268,6 +278,41 @@ final class Flattener {
         l.add(Opcodes.INTEGER);
         return l.toArray();
     }
+
+    /**
+     * True if some non-entry block reads a local that is not (a) a parameter, (b) assigned in the
+     * entry block, or (c) assigned earlier in that same block — i.e. a local the JVM verifier cannot
+     * prove definitely-assigned once the opaque dispatcher hides the real predecessor.
+     */
+    private static boolean hasUnsafeCrossBlockLocal(MethodNode mn, List<Block> blocks) {
+        int firstLocal = ((mn.access & Opcodes.ACC_STATIC) != 0) ? 0 : 1;
+        for (Type t : Type.getArgumentTypes(mn.desc)) firstLocal += t.getSize();
+
+        Set<Integer> safe = new HashSet<>();               // params + entry-block assignments
+        for (int v = 0; v < firstLocal; v++) safe.add(v);
+        for (AbstractInsnNode in : blocks.get(0).body) {
+            if (in instanceof VarInsnNode && isStore(in.getOpcode())) safe.add(((VarInsnNode) in).var);
+            else if (in instanceof IincInsnNode) safe.add(((IincInsnNode) in).var);
+        }
+        for (int bi = 1; bi < blocks.size(); bi++) {
+            Set<Integer> written = new HashSet<>();
+            for (AbstractInsnNode in : blocks.get(bi).body) {
+                if (in instanceof VarInsnNode) {
+                    int op = in.getOpcode(), v = ((VarInsnNode) in).var;
+                    if (isLoad(op)) { if (!safe.contains(v) && !written.contains(v)) return true; }
+                    else if (isStore(op)) written.add(v);
+                } else if (in instanceof IincInsnNode) {
+                    int v = ((IincInsnNode) in).var;
+                    if (!safe.contains(v) && !written.contains(v)) return true;
+                    written.add(v);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isLoad(int op) { return op >= Opcodes.ILOAD && op <= Opcodes.ALOAD; }
+    private static boolean isStore(int op) { return op >= Opcodes.ISTORE && op <= Opcodes.ASTORE; }
 
     // ---- opcode predicates ----------------------------------------------------------------
 
