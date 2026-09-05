@@ -73,10 +73,6 @@ public final class Injector {
             }
         }
 
-        // Obfuscate ONLY our injected classes (relocPrefix/**, minus shaded lib and GeneratedConfig).
-        // Runs last, on the assembled map, so it can never touch host entries.
-        out = Obfuscator.obfuscate(out, relocPrefix, salt);
-
         JarModel assembled = JarModelFrom(out);
         return new Result(assembled.toBytes(), hook.mode, relocPrefix, buildId,
                 warnings, ClientPayload.version());
