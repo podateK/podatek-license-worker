@@ -12,21 +12,28 @@ import java.util.LinkedHashMap;
 import java.util.Iterator;
 import java.util.Map;
 
-/** Javalin HTTP surface: POST /inject (bearer) + GET /healthz. */
+/** Javalin HTTP surface: plugin and package protection endpoints + health check. */
 public final class Server {
 
     static final long MAX_JAR_BYTES = 100L * 1024 * 1024; // 100 MB
+    static final long MAX_PACKAGE_BYTES = 500L * 1024 * 1024; // 500 MB
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private Server() {}
 
     public static Javalin create(int port, String secret) {
         Javalin app = Javalin.create(cfg -> {
-            cfg.http.maxRequestSize = MAX_JAR_BYTES + (1L * 1024 * 1024); // headroom for multipart envelope
+            cfg.http.maxRequestSize = MAX_PACKAGE_BYTES + (1L * 1024 * 1024); // multipart headroom
             cfg.showJavalinBanner = false;
         });
 
         app.before("/inject", ctx -> {
+            String auth = ctx.header("Authorization");
+            if (auth == null || !auth.equals("Bearer " + secret)) {
+                throw new UnauthorizedResponse("brak lub bledny Bearer token");
+            }
+        });
+        app.before("/protect-package", ctx -> {
             String auth = ctx.header("Authorization");
             if (auth == null || !auth.equals("Bearer " + secret)) {
                 throw new UnauthorizedResponse("brak lub bledny Bearer token");
@@ -41,6 +48,7 @@ public final class Server {
         });
 
         app.post("/inject", Server::handleInject);
+        app.post("/protect-package", Server::handleProtectPackage);
 
         app.exception(InjectException.class, (e, ctx) ->
                 ctx.status(e.status()).json(Map.of("error", e.getMessage())));
@@ -50,6 +58,35 @@ public final class Server {
                 ctx.status(500).json(Map.of("error", "wewnetrzny blad workera")));
 
         return app.start(port);
+    }
+
+    private static void handleProtectPackage(Context ctx) throws Exception {
+        UploadedFile archive = ctx.uploadedFile("archive");
+        if (archive == null) {
+            throw new InjectException(400, "brak pliku 'archive' w multipart");
+        }
+        if (archive.size() > MAX_PACKAGE_BYTES) {
+            throw new InjectException(413, "paczka przekracza limit 500 MB");
+        }
+        byte[] source;
+        try (InputStream is = archive.content()) {
+            source = is.readAllBytes();
+        }
+
+        String configRaw = ctx.formParam("config");
+        if (configRaw == null || configRaw.isBlank()) {
+            throw new InjectException(400, "brak pola 'config'");
+        }
+        InjectConfig cfg = parseConfig(configRaw);
+        PackageProtector.Result result = PackageProtector.protect(source, cfg);
+
+        ctx.status(200);
+        ctx.contentType("application/zip");
+        ctx.header("X-Pack-Build-Id", result.buildId());
+        ctx.header("X-Pack-Plugin-Count", Integer.toString(result.pluginCount()));
+        ctx.header("X-Pack-Skipped-Count", Integer.toString(result.skippedCount()));
+        ctx.header("X-Pack-Manifest-Sha256", result.manifestSha256());
+        ctx.result(result.archive());
     }
 
     private static void handleInject(Context ctx) throws Exception {

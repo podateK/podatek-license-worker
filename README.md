@@ -12,6 +12,18 @@ code (static ASM analysis only). The Plan 3 client jar is baked into the image a
 
 ## HTTP contract
 
+### `POST /protect-package`
+- **Auth:** ten sam Bearer co `/inject`.
+- **Request:** multipart `archive` (ZIP, do 500 MB) + `config` o tym samym
+  ksztaĹ‚cie co `/inject`; `pluginId` jest slugiem paczki.
+- Worker skanuje archiwum bez wykonywania kodu, dopisuje klasycznym pluginom
+  twardÄ… zaleĹĽnoĹ›Ä‡ `PodatekPackGuard`, tworzy osobny guard z jednym klientem
+  licencji oraz zapisuje `PodatekPack/manifest.json` z hashami SHA-256.
+- Ochrona ZIP odrzuca Ĺ›cieĹĽki absolutne/`..`, ponad 10 tys. wpisĂłw i ponad
+  2 GB danych po rozpakowaniu.
+- **200:** chroniony ZIP oraz nagĹ‚Ăłwki `X-Pack-Build-Id`,
+  `X-Pack-Plugin-Count`, `X-Pack-Skipped-Count`, `X-Pack-Manifest-Sha256`.
+
 ### `POST /inject`
 - **Auth:** `Authorization: Bearer <INJECT_WORKER_SECRET>` (401 otherwise).
 - **Request:** `multipart/form-data`

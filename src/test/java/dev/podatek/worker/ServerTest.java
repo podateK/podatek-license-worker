@@ -10,6 +10,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.io.ByteArrayOutputStream;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -24,7 +25,7 @@ class ServerTest {
 
     private HttpResponse<byte[]> postInject(String bearer, byte[] jar, String configJson) throws Exception {
         String boundary = "----plw" + System.nanoTime();
-        byte[] body = multipart(boundary, jar, configJson);
+        byte[] body = multipart(boundary, "jar", "master.jar", jar, configJson);
         HttpRequest.Builder b = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port() + "/inject"))
                 .header("Content-Type", "multipart/form-data; boundary=" + boundary)
@@ -33,16 +34,29 @@ class ServerTest {
         return HttpClient.newHttpClient().send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
     }
 
-    private static byte[] multipart(String boundary, byte[] jar, String configJson) throws Exception {
+    private HttpResponse<byte[]> postPackage(String bearer, byte[] archive, String configJson) throws Exception {
+        String boundary = "----plw" + System.nanoTime();
+        byte[] body = multipart(boundary, "archive", "package.zip", archive, configJson);
+        HttpRequest.Builder b = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port() + "/protect-package"))
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+        if (bearer != null) b.header("Authorization", "Bearer " + bearer);
+        return HttpClient.newHttpClient().send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private static byte[] multipart(String boundary, String fieldName, String fileName,
+                                    byte[] file, String configJson) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         String dd = "--";
         String crlf = "\r\n";
-        if (jar != null) {
+        if (file != null) {
             bos.write((dd + boundary + crlf).getBytes(StandardCharsets.UTF_8));
-            bos.write(("Content-Disposition: form-data; name=\"jar\"; filename=\"master.jar\"" + crlf)
+            bos.write(("Content-Disposition: form-data; name=\"" + fieldName
+                    + "\"; filename=\"" + fileName + "\"" + crlf)
                     .getBytes(StandardCharsets.UTF_8));
-            bos.write(("Content-Type: application/java-archive" + crlf + crlf).getBytes(StandardCharsets.UTF_8));
-            bos.write(jar);
+            bos.write(("Content-Type: application/octet-stream" + crlf + crlf).getBytes(StandardCharsets.UTF_8));
+            bos.write(file);
             bos.write(crlf.getBytes(StandardCharsets.UTF_8));
         }
         if (configJson != null) {
@@ -99,5 +113,27 @@ class ServerTest {
         HttpResponse<byte[]> res = postInject(SECRET,
                 "this is not a jar".getBytes(StandardCharsets.UTF_8), CONFIG_JSON);
         assertEquals(400, res.statusCode());
+    }
+
+    @Test void packageProtectionRequiresBearer() throws Exception {
+        app = Server.create(0, SECRET);
+        byte[] plugin = Fixtures.pluginJar("com.demo.DemoPlugin", Fixtures.DEMO_YML);
+        HttpResponse<byte[]> res = postPackage(null,
+                PackageProtector.writeZip(Map.of("plugins/Demo.jar", plugin)), CONFIG_JSON);
+        assertEquals(401, res.statusCode());
+    }
+
+    @Test void packageProtectionReturnsGuardManifestAndHeaders() throws Exception {
+        app = Server.create(0, SECRET);
+        byte[] plugin = Fixtures.pluginJar("com.demo.DemoPlugin", Fixtures.DEMO_YML);
+        HttpResponse<byte[]> res = postPackage(SECRET,
+                PackageProtector.writeZip(Map.of("plugins/Demo.jar", plugin)), CONFIG_JSON);
+        assertEquals(200, res.statusCode());
+        assertEquals("application/zip", res.headers().firstValue("Content-Type").orElse(""));
+        assertEquals("1", res.headers().firstValue("X-Pack-Plugin-Count").orElse(""));
+        assertTrue(res.headers().firstValue("X-Pack-Build-Id").isPresent());
+        Map<String, byte[]> archive = PackageProtector.readZip(res.body());
+        assertTrue(archive.containsKey("plugins/PodatekPackGuard.jar"));
+        assertTrue(archive.containsKey("PodatekPack/manifest.json"));
     }
 }
